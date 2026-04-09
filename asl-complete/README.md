@@ -175,5 +175,5 @@ totime = 360000     ; 6 minuten (standaard 3 minuten)
 
 ## Auteur
 
-Amateur radio operator — Nederland  
+Amateur radio operator PE1BZF — Nederland  
 [AllStarLink](https://allstarlink.org)
