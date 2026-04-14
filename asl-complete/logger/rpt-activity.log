@@ -1,9 +1,0 @@
-2026-01-01 12:00:00 AMI logger gestart
-2026-01-01 12:00:15 [TX-AAN]  node=400001 begint uitzenden
-2026-01-01 12:00:22 [TX-UIT]  node=400001 stopt uitzenden
-2026-01-01 12:01:00 [LINK]    node=400001 verbonden
-2026-01-01 12:01:00 [LINK]    node=400002 verbonden
-2026-01-01 12:01:00 [LINK]    node=N0CALL verbonden
-2026-01-01 12:01:05 [TX-AAN]  node=400001 begint uitzenden
-2026-01-01 12:01:10 [TX-UIT]  node=400001 stopt uitzenden
-2026-01-01 12:02:00 [UNLINK]  node=400002 verbroken
