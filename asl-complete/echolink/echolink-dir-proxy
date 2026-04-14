@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""
+EchoLink directory proxy for ASL3 chan_echolink compatibility.
+
+Login connections: proxied to real EchoLink servers (needed for registration).
+Directory F0 requests: answered with an empty @@@/0/+++ response so
+  chan_echolink can complete startup without errors.
+"""
+import socket
+import threading
+import time
+import logging
+import json
+import zlib
+
+logging.basicConfig(level=logging.INFO,
+    format='%(asctime)s echolink-proxy %(levelname)s: %(message)s')
+log = logging.getLogger()
+
+LISTEN_HOST = "127.0.0.1"
+LISTEN_PORT = 5200
+
+REAL_SERVERS = [
+    "nasouth.echolink.org",
+    "naeast.echolink.org",
+    "servers.echolink.org",
+    "backup.echolink.org",
+]
+
+# Minimal valid empty directory in old chan_echolink format
+EMPTY_DIRECTORY = b"@@@\n0\n+++\n"
+
+
+def connect_to_server():
+    for srv in REAL_SERVERS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(15)
+            s.connect((srv, 5200))
+            return s, srv
+        except Exception as e:
+            log.debug(f"Cannot connect to {srv}: {e}")
+    return None, None
+
+
+def recv_login_resp(sock, timeout=10):
+    """Read until OK/INVALID/DENIED or timeout."""
+    resp = b""
+    sock.settimeout(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            resp += chunk
+            if b"OK" in resp or b"INVALID" in resp or b"DENIED" in resp:
+                break
+        except socket.timeout:
+            break
+    return resp
+
+
+def handle_login(client_sock, data):
+    """Proxy login packet to real EchoLink server, return its response."""
+    real, srv = connect_to_server()
+    if not real:
+        log.error("No EchoLink servers available for login")
+        return
+    try:
+        real.settimeout(10)
+        real.send(data)
+        resp = recv_login_resp(real)
+        log.info(f"Login via {srv}: {repr(resp[:20])}")
+        client_sock.send(resp)
+    except Exception as e:
+        log.error(f"Login error: {e}")
+    finally:
+        real.close()
+
+
+EL_DIR_CACHE = '/var/log/asterisk/echolink-full-dir.bin'
+EL_NODE_CACHE = '/var/log/asterisk/echolink-cache.json'
+
+
+def parse_directory(raw_data):
+    """Parse binary EchoLink directory, return {nodenr: callsign} dict."""
+    try:
+        unc = zlib.decompress(raw_data[4:])
+    except Exception as e:
+        log.warning(f"Decompress mislukt: {e}")
+        return {}
+    text = unc.decode("latin-1")
+    # Use split("\n") not splitlines() — Shift-JIS bytes can contain 0x85 (NEL)
+    # which Python's splitlines() incorrectly treats as a line separator
+    lines = text.split("\n")
+    records = lines[2:]  # skip "@@@" and count line
+    db = {}
+    for i in range(0, len(records) - 3, 4):
+        callsign = records[i].strip()
+        nodenr   = records[i + 2].strip()
+        if nodenr.isdigit() and callsign:
+            db[nodenr] = callsign
+    return db
+
+
+def save_node_cache(db):
+    """Merge parsed db with existing cache and save."""
+    try:
+        with open(EL_NODE_CACHE) as f:
+            existing = json.load(f)
+        existing.update(db)
+        db = existing
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Cache lezen mislukt: {e}")
+    try:
+        with open(EL_NODE_CACHE, "w") as f:
+            json.dump(db, f)
+        log.info(f"EchoLink node cache opgeslagen: {len(db)} entries")
+    except Exception as e:
+        log.error(f"Cache schrijven mislukt: {e}")
+
+
+def fetch_real_directory():
+    """Haal de echte EchoLink directory op via F0 (werkt na IP-authenticatie door login)."""
+    for srv in REAL_SERVERS:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(30)
+            s.connect((srv, 5200))
+            s.send(b'F0\r')
+            buf = b''
+            s.settimeout(5)
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except socket.timeout:
+                    break
+            s.close()
+            if len(buf) > 1000:
+                with open(EL_DIR_CACHE, 'wb') as f:
+                    f.write(buf)
+                log.info(f"EchoLink directory opgehaald: {len(buf)} bytes van {srv}")
+                db = parse_directory(buf)
+                log.info(f"Geparsed: {len(db)} EchoLink nodes")
+                save_node_cache(db)
+                return buf
+        except Exception as e:
+            log.debug(f"Directory fetch van {srv} mislukt: {e}")
+    return None
+
+def handle_directory(client_sock):
+    """Return empty directory to chan_echolink, maar haal echte directory op op de achtergrond."""
+    log.info("Returning empty directory to chan_echolink")
+    try:
+        client_sock.send(EMPTY_DIRECTORY)
+    except Exception as e:
+        log.error(f"Directory send error: {e}")
+    # Haal echte directory op in achtergrond-thread (IP is net geauthenticeerd via login)
+    threading.Thread(target=fetch_real_directory, daemon=True).start()
+
+
+def handle_client(client_sock, addr):
+    try:
+        client_sock.settimeout(15)
+        data = b""
+        deadline = time.time() + 5
+        while time.time() < deadline and len(data) < 512:
+            try:
+                chunk = client_sock.recv(512)
+                if not chunk:
+                    break
+                data += chunk
+                if data.startswith(b"l") and data.count(b"\r") >= 4:
+                    break
+                if data.startswith(b"F") and b"\r" in data:
+                    break
+            except socket.timeout:
+                break
+
+        if not data:
+            return
+
+        if data.startswith(b"l"):
+            log.info(f"Login connection from {addr}")
+            handle_login(client_sock, data)
+        elif data.startswith(b"F"):
+            log.info(f"Directory request from {addr}: {repr(data[:20])}")
+            handle_directory(client_sock)
+        else:
+            log.warning(f"Unknown connection type from {addr}: {repr(data[:20])}")
+    except Exception as e:
+        log.error(f"Client handler error: {e}")
+    finally:
+        try:
+            client_sock.close()
+        except:
+            pass
+
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((LISTEN_HOST, LISTEN_PORT))
+    srv.listen(10)
+    log.info(f"EchoLink proxy listening on {LISTEN_HOST}:{LISTEN_PORT}")
+
+    while True:
+        try:
+            client, addr = srv.accept()
+            t = threading.Thread(target=handle_client, args=(client, addr), daemon=True)
+            t.start()
+        except Exception as e:
+            log.error(f"Accept error: {e}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
